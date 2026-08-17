@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { pool } from "./db.js";
 import { authorize, type RequestContext } from "./auth.js";
+import { ensureKbProvisioned } from "./provisioning.js";
 import { recordAudit } from "./audit.js";
 
 // write()는 spec §4.1 시그니처에 title 인자가 없지만 pages.title은 NOT NULL이라,
@@ -166,6 +167,11 @@ export function registerTools(server: McpServer, ctx: RequestContext): void {
       if (!decision.allowed) {
         return denied(decision.reason);
       }
+
+      // write는 대상 kb_id를 명확히 겨냥하는 tool이라(§4.4) 여기서 KB 즉석 프로비저닝을
+      // 트리거한다 — authorize()가 이미 통과했으므로(project: read≥, personal: 본인)
+      // 이 요청은 해당 KB에 정당하게 접근 가능하다.
+      await ensureKbProvisioned(pool, kb_id);
 
       const client = await pool.connect();
       try {

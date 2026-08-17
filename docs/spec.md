@@ -454,6 +454,7 @@ services:
 | MCP 프로토콜 | 공식 SDK v2 (모듈 분리) — `@modelcontextprotocol/server`(`McpServer`, stdio), `@modelcontextprotocol/node`(Streamable HTTP transport), `@modelcontextprotocol/client`(wiki-cli의 원격 relay) | v1 `@modelcontextprotocol/sdk`(모놀리식)는 deprecated, 신규 프로젝트는 v2로 시작 |
 | 웹 프레임워크 | Fastify + `@modelcontextprotocol/fastify`(공식 어댑터) | 어댑터는 Fastify 앱 생성 + DNS rebinding/Origin 헤더 보호만 제공 — tool 등록·transport 연결은 `@modelcontextprotocol/server`/`node`를 직접 사용 |
 | DB | Postgres 18 | 본문 저장 + full-text 검색 + 권한 캐시 + 이력/draft |
+| DB 마이그레이션 | `node-pg-migrate` | ORM 없이 raw SQL 유지 — §3.2의 `FOR UPDATE` 락, `GENERATED ALWAYS AS ... STORED` 컬럼 등을 그대로 쓰기 위함. 마이그레이션 파일은 `pgm.sql()`로 원본 SQL을 감싸는 방식 |
 | 인증 | GitHub OAuth App | 별도 IdP 불필요 |
 | 리버스 프록시/TLS | Caddy | 자동 HTTPS |
 | 클라이언트/인입 | wiki-cli (자체 개발, 단일 패키지 · `mcp`/`push`/`login` 서브커맨드) | 전역 1회 등록, 진입 경로 무관하게 동일 API 재사용 |

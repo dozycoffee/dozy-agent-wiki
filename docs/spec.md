@@ -405,6 +405,11 @@ KB 전체가 아니라 **경로 패턴 단위**로 신중한 처리를 강제한
 6. 허용/거부 결정 → audit_log 기록
 ```
 
+> 구현 메모(1차): `audit_log.action`엔 허용/거부를 구분하는 별도 컬럼이 없어, 거부된
+> 시도는 `action`에 `_denied` 접미사를 붙여 기록한다 (예: `read_denied`). 컬럼은 자유
+> text라 스키마 변경 없이 가능하지만, 조회/집계를 자주 하게 되면 전용 `allowed boolean`
+> 컬럼 추가를 고려할 것.
+
 ### 5.3 예외 처리
 
 | 상황 | 처리 |
@@ -437,6 +442,8 @@ services:
       - DATABASE_URL=postgresql://...
       - GITHUB_OAUTH_CLIENT_ID=...
       - GITHUB_OAUTH_CLIENT_SECRET=...
+      - GITHUB_ORG=...   # org KB 읽기 권한(§5.1) 판단용 조직 slug. 미설정 시 인증된 사용자는 누구나 org read 허용(완화된 기본값)
+      - WIKI_ADMINS=...  # org KB 쓰기 권한(§5.1) 판단용 github_user 콤마 목록. 미설정 시 org write는 전원 거부(안전한 기본값)
     depends_on: [postgres]
   caddy:
     image: caddy:2

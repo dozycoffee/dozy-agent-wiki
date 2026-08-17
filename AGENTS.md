@@ -12,7 +12,7 @@
 
 - 언어: TypeScript (Node.js) — CLI/서버 통일
 - 서버: Fastify + `@modelcontextprotocol/server`/`node`(v2 SDK) + `@modelcontextprotocol/fastify`(어댑터), Streamable HTTP
-- DB: PostgreSQL 18
+- DB: PostgreSQL 18, 마이그레이션은 `node-pg-migrate` (ORM 없이 raw SQL 유지)
 - 인증: GitHub OAuth App (리소스 서버 패턴, 자체 로그인 없음)
 - 리버스 프록시: Caddy
 - 배포: 단일 VM + docker-compose

@@ -254,6 +254,8 @@ get_kb_version(kb_id) → { version: 42 }
 ### 4.3 인증
 
 - `wiki-cli login`으로 최초 1회 GitHub OAuth 로그인 → 토큰을 평문 파일이 아닌 **OS 키체인**(macOS Keychain / Windows Credential Manager / libsecret 등, 플랫폼별 credential store)에 저장.
+  - 로그인 플로우: **Device Flow** 채택. npm으로 배포되는 public 클라이언트라 client secret을 안전히 담을 곳이 없고, Authorization Code + PKCE와 달리 로컬에 redirect용 HTTP 서버를 띄우지 않아도 된다 (포트 충돌/방화벽 이슈 없음). `GITHUB_OAUTH_CLIENT_ID` 환경변수로 client id를 받는다 (mcp-server와 동일한 GitHub OAuth App 사용, docker-compose.yml 참조).
+  - 키체인 구현: [`@napi-rs/keyring`](https://github.com/Brooooooklyn/keyring-node) (keyring-rs의 Node 바인딩, 플랫폼별 prebuilt binary 배포). service/account는 각각 `dozy-agent-wiki` / `github-token`으로 고정.
 - 서버는 매 요청마다 토큰의 유효성을 GitHub `GET /user`로 검증 (결과는 짧은 TTL로 캐시).
 - 서비스 계정(nightly routine 등 자동화 작업)은 GitHub App 설치 토큰을 별도로 사용 — 개인 PAT와 credential을 분리한다.
 

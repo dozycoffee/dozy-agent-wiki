@@ -42,3 +42,7 @@ docker-compose.yml
 
 - `wiki-cli mcp` 서브커맨드는 stdout에 JSON-RPC만 흘러야 하므로, 이 경로의 모든 로그는 stderr로만 출력한다 (§4.2 참조).
 - 세션 커밋(`commit_session`)의 충돌 감지는 KB 전체가 아니라 **건드린 slug만** 비교한다 — `FOR UPDATE` + slug 알파벳순 잠금으로 데드락을 피한다 (§4.6).
+
+## 브랜치 / 커밋 / PR
+
+브랜치 전략, 커밋 컨벤션(`feat`/`fix`/`chore` 등), PR 체크리스트는 [`CONTRIBUTING.md`](./CONTRIBUTING.md)를 따른다.

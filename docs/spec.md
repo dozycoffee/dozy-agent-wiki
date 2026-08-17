@@ -246,6 +246,8 @@ get_kb_version(kb_id) → { version: 42 }
   2. OS 키체인에 저장된 GitHub 토큰(`login` 서브커맨드가 저장) 로드
   3. 실제 MCP 서버로 HTTP 요청 전달 (`X-Repo`, `Authorization` 헤더 첨부)
 - 이 컴포넌트 덕분에 **프로젝트 디렉토리 자체에는 아무 설정 파일도 필요 없음**.
+- 실제 MCP 서버 주소는 `WIKI_SERVER_URL` 환경변수로 설정 (기본값 `http://localhost:8080`, 프로덕션에서는 배포 시 설정). 서버의 MCP 엔드포인트는 `${WIKI_SERVER_URL}/mcp`.
+- tool 목록/스키마는 하드코딩하지 않는다 — 로컬 stdio transport와 원격 Streamable HTTP transport를 메시지 레벨에서 그대로 중계(relay)하여, 서버에 새 tool이 추가되어도 wiki-cli 쪽 변경 없이 그대로 노출된다.
 
 **구현 시 주의점** — `mcp` 서브커맨드는 stdout으로 JSON-RPC를 주고받으므로, 이 모드에서는 모든 로그를 stderr로만 출력해야 한다 (stdout에 다른 텍스트가 섞이면 프로토콜이 깨짐). `push`/`login`/`whoami` 등 일반 서브커맨드는 이 제약이 없다.
 
@@ -254,6 +256,7 @@ get_kb_version(kb_id) → { version: 42 }
 ### 4.3 인증
 
 - `wiki-cli login`으로 최초 1회 GitHub OAuth 로그인 → 토큰을 평문 파일이 아닌 **OS 키체인**(macOS Keychain / Windows Credential Manager / libsecret 등, 플랫폼별 credential store)에 저장.
+  - 구현: [`@napi-rs/keyring`](https://github.com/Brooooooklyn/keyring-node) (keyring-rs의 Node 바인딩, 플랫폼별 prebuilt binary 배포) 사용. service/account는 각각 `dozy-agent-wiki` / `github-token`으로 고정.
 - 서버는 매 요청마다 토큰의 유효성을 GitHub `GET /user`로 검증 (결과는 짧은 TTL로 캐시).
 - 서비스 계정(nightly routine 등 자동화 작업)은 GitHub App 설치 토큰을 별도로 사용 — 개인 PAT와 credential을 분리한다.
 

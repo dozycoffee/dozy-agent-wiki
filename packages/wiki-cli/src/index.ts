@@ -6,6 +6,7 @@
 // 이 경로에서는 어떤 로그도 stdout에 출력하지 말 것 (console.error만 사용).
 
 import { Command } from "commander";
+import { runMcpRelay } from "./mcp-relay.js";
 
 const program = new Command();
 
@@ -15,11 +16,13 @@ program
   .command("mcp")
   .description("stdio 기반 로컬 MCP 서버로 실행 (에이전트가 자동 실행)")
   .action(async () => {
-    // TODO(§4.2): git remote get-url origin → repo 식별자 추출
-    // TODO(§4.2): OS 키체인에서 GitHub 토큰 로드
-    // TODO(§4.2): StdioServerTransport로 MCP tool을 실제 서버(HTTP)로 중계
-    console.error("[wiki-cli mcp] not implemented yet");
-    process.exit(1);
+    try {
+      await runMcpRelay();
+    } catch (err) {
+      // 이 경로는 stdout에 JSON-RPC만 흘러야 하므로 반드시 stderr로만 로그를 남긴다.
+      console.error("[wiki-cli mcp] fatal error:", err);
+      process.exitCode = 1;
+    }
   });
 
 program

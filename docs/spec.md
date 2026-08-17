@@ -475,20 +475,20 @@ services:
 
 ## 8. MVP 범위
 
-**1차 구현 (필수)**
+**1차 구현 (필수) — 완료**
 - MCP 서버: `search`, `read`, `write`(shorthand), `list_kbs` 4개 tool
 - Postgres 스키마 (§3.2, `pages.version` 포함) + GitHub 토큰 검증 + 권한 캐시
 - `wiki-cli mcp` 서브커맨드 (로컬 MCP 클라이언트)
+- `wiki-cli login`/`whoami` 서브커맨드 (GitHub OAuth device flow, OS 키체인)
 - KB 즉석 자동 생성 로직 (`_index`, `_log` 포함)
-- 단일 페이지 커밋 시 `expected_version` 비교 (충돌 감지 최소 버전)
+- 단일 페이지 커밋 시 `expected_version` 비교 + `pages_history` 이력 기록 (충돌 감지 최소 버전)
 
 **2차 구현**
-- `append`, `delete`, `revert`, `list_pages`, `lint`, `get_kb_version` tool
+- `append`, `delete`, `revert`, `list_pages`, `lint` tool
 - `open_session`/`stage_write`/`stage_append`/`stage_delete`/`commit_session`/`abort_session` (다중 페이지 원자적 커밋)
-- `pages_history` 이력 기록
-- `kb_versions` 워터마크 + `read`/`search` 응답에 `version` 포함
+- `kb_versions` 워터마크 + `get_kb_version` tool + `read`/`search` 응답에 `version` 포함
 - `protected_patterns` + `pages_draft` 승인 흐름 (block/notify)
-- `wiki-cli push`/`login`/`whoami` 서브커맨드
+- `wiki-cli push` 서브커맨드
 - nightly 자동 컴파일 routine (원본 자료 → wiki 반영)
 - GitHub 웹훅 기반 사전 프로비저닝
 

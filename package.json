@@ -1,0 +1,16 @@
+{
+  "name": "dozy-agent-wiki",
+  "private": true,
+  "version": "0.0.1",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "dev:server": "npm run dev --workspace=@dozy-agent-wiki/mcp-server",
+    "dev:cli": "npm run dev --workspace=@dozy-agent-wiki/wiki-cli"
+  }
+}

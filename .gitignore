@@ -11,3 +11,4 @@ coverage/
 .vscode/
 .idea/
 CLAUDE.local.md
+.claude/worktrees/

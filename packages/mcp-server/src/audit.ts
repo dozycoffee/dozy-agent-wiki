@@ -25,3 +25,20 @@ export async function recordAudit(
     [githubUser ?? null, kbId, actionValue],
   );
 }
+
+// §4.7 mode='notify' — 즉시 반영은 하되 승인권자에게 diff를 알려야 한다. 알림 채널
+// (Slack/이메일 등)은 §9 미해결 이슈라 아직 없으므로, "일단 로그/DB 기록까지만 해도
+// 됨"이라는 이슈 본문 지침대로 audit_log에 매칭된 slug/pattern을 기록하는 선에서
+// 그친다. action 컬럼이 자유 text라 별도 테이블 없이 여기 슬러그 목록을 그대로 담는다.
+export async function recordProtectedNotify(
+  pool: Pool,
+  githubUser: string | undefined,
+  kbId: string,
+  matched: Array<{ slug: string; pattern: string }>,
+): Promise<void> {
+  const detail = matched.map((m) => `${m.slug}~${m.pattern}`).join(",");
+  await pool.query(
+    `INSERT INTO audit_log (github_user, kb_id, action) VALUES ($1, $2, $3)`,
+    [githubUser ?? null, kbId, `protected_notify:${detail}`],
+  );
+}

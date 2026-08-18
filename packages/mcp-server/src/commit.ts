@@ -15,6 +15,8 @@ import type { Pool } from "pg";
 import { parseKbId } from "./kbId.js";
 import { bumpKbVersion } from "./kbVersions.js";
 import { deriveTitle, appendContent } from "./pageUtils.js";
+import { classifyProtection, type ProtectionMatch } from "./protection.js";
+import { recordProtectedNotify } from "./audit.js";
 
 export type ChangeAction = "write" | "append" | "delete";
 
@@ -42,7 +44,8 @@ export interface ConflictInfo {
 
 export type CommitResult =
   | { status: "committed"; results: AppliedResult[] }
-  | { status: "conflict"; conflicts: ConflictInfo[] };
+  | { status: "conflict"; conflicts: ConflictInfo[] }
+  | { status: "draft"; draftIds: number[]; matched: ProtectionMatch[] };
 
 interface FoldResult {
   deleted: boolean;
@@ -95,6 +98,15 @@ function reduceBySlug(changes: PendingChange[]): Map<string, { expectedVersion: 
  * 신규/수정/삭제를 모두 처리한다 (데드락 방지 + false positive 충돌 방지).
  *
  * personal KB는 즉시 하드 삭제, org/project는 soft-delete(deleted_at)로 처리한다 (§5.1).
+ *
+ * §4.7 protected_patterns 게이트: 충돌 검사를 통과한 뒤, touched slug들을
+ * classifyProtection()으로 분류한다.
+ *   - "block": pages에는 전혀 반영하지 않고, slug별 최종(fold된) 상태를 그대로
+ *     pages_draft에 pending으로 남긴다. write/append shorthand든 commit_session이든
+ *     이 함수 하나를 거치므로 두 경로 모두 자동으로 게이트를 통과한다.
+ *   - "notify": 평소처럼 즉시 반영하되, 커밋 후 recordProtectedNotify()로
+ *     audit_log에 알림 기록을 남긴다("일단 로그/DB 기록까지만 해도 됨", §4.7).
+ *   - "none": 평소와 동일.
  */
 export async function commitChanges(
   pool: Pool,
@@ -134,6 +146,26 @@ export async function commitChanges(
     if (conflicts.length > 0) {
       await client.query("ROLLBACK");
       return { status: "conflict", conflicts };
+    }
+
+    const protection = await classifyProtection(client, kbId, touchedSlugs);
+
+    if (protection.mode === "block") {
+      const draftIds: number[] = [];
+      for (const slug of touchedSlugs) {
+        const { ops } = bySlug.get(slug)!;
+        const state = rowState.get(slug)!;
+        const folded = foldOps(state.contentMd ?? "", ops);
+        const draftAction = folded.deleted ? "delete" : "write";
+        const { rows } = await client.query<{ id: number }>(
+          `INSERT INTO pages_draft (kb_id, slug, content_md, action, proposed_by)
+           VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+          [kbId, slug, folded.deleted ? null : folded.content, draftAction, githubUser ?? null],
+        );
+        draftIds.push(rows[0].id);
+      }
+      await client.query("COMMIT");
+      return { status: "draft", draftIds, matched: protection.matched };
     }
 
     const results: AppliedResult[] = [];
@@ -191,6 +223,11 @@ export async function commitChanges(
     await bumpKbVersion(client, kbId);
 
     await client.query("COMMIT");
+
+    if (protection.mode === "notify") {
+      // 즉시 반영은 이미 끝났으니 트랜잭션 밖에서 알림만 기록한다 (§4.7).
+      await recordProtectedNotify(pool, githubUser, kbId, protection.matched);
+    }
 
     return { status: "committed", results };
   } catch (err) {

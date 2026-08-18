@@ -34,6 +34,20 @@ function respondFromCommit(kbId: string, result: CommitResult, verb: string) {
     };
   }
 
+  if (result.status === "draft") {
+    // §4.7: protected_patterns(mode='block')에 걸려 즉시 반영되지 않고 승인 대기.
+    // 에러는 아니다 — 요청 자체는 정상 접수됐고, 반영만 보류된 상태.
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `queued for approval: ${kbId} — ${result.draftIds.length} page(s) pending review (protected pattern matched)`,
+        },
+      ],
+      structuredContent: { status: "draft", draft_ids: result.draftIds, matched: result.matched },
+    };
+  }
+
   const [applied] = result.results;
   return {
     content: [
@@ -669,6 +683,24 @@ export function registerTools(server: McpServer, ctx: RequestContext): void {
             { type: "text", text: `session conflict: ${result.conflicts.length} slug(s)` },
           ],
           structuredContent: { status: "conflict", conflicts: result.conflicts },
+        };
+      }
+
+      if (result.status === "draft") {
+        // §4.7: 세션이 protected 경로를 하나라도 건드리면 전체가 draft로 넘어간다.
+        // 세션 자체의 생애주기는 "정상적으로 끝남" 쪽이라 status='committed'로 마킹하고
+        // (edit_sessions.status enum에는 'draft'가 없다 — §3.2), 실제 반영 여부는
+        // 별도 pages_draft.status(pending/approved/rejected)로 추적한다.
+        await pool.query(`UPDATE edit_sessions SET status = 'committed' WHERE id = $1`, [session_id]);
+        await recordAudit(pool, ctx.githubUser, session.kb_id, "commit_session", true);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `queued for approval: session ${session_id} — ${result.draftIds.length} page(s) pending review (protected pattern matched)`,
+            },
+          ],
+          structuredContent: { status: "draft", draft_ids: result.draftIds, matched: result.matched },
         };
       }
 

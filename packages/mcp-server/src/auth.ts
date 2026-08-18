@@ -5,7 +5,9 @@
 //   2. 요청 대상 kb_id 확인
 //   3. kb.type별 권한 규칙 적용 (§5.1)
 //   4. project KB의 경우 permission_cache 조회, 없으면 GitHub API 호출 후 짧은 TTL로 캐시
-//   5. (protected_patterns는 §4.7, 이 이슈 범위 밖)
+//   5. write/delete인 경우 protected_patterns 매칭 확인 → draft 경유 여부 결정
+//      (이 파일의 authorize()가 아니라 commit.ts의 commitChanges()가 커밋 시점에
+//      classifyProtection()으로 수행한다 — §4.7, protection.ts 참고)
 //   6. 허용/거부 결정 → audit_log 기록 (audit.ts)
 
 import type { Pool } from "pg";
@@ -103,8 +105,10 @@ async function isOrgReadAllowed(ctx: RequestContext, githubUser: string): Promis
 }
 
 /**
- * kb_id 하나에 대한 read/write 권한을 판단한다 (§5.1 매핑 규칙).
- * protected_patterns/pages_draft 게이트(§4.7)는 이 함수의 범위 밖 — 별도 이슈.
+ * kb_id 하나에 대한 read/write/delete 권한을 판단한다 (§5.1 매핑 규칙).
+ * protected_patterns/pages_draft 게이트(§4.7)는 이 함수의 범위 밖이다 — "이 유저가
+ * 이 KB에 쓸 수 있는가"(권한)와 "이 경로가 즉시 반영돼도 되는가"(보호 정책)는
+ * 별개 판단이라, 후자는 commit.ts의 commitChanges()가 커밋 시점에 처리한다.
  */
 export async function authorize(
   ctx: RequestContext,

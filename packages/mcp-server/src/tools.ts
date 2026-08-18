@@ -4,6 +4,7 @@ import { pool } from "./db.js";
 import { authorize, type RequestContext } from "./auth.js";
 import { ensureKbProvisioned } from "./provisioning.js";
 import { recordAudit } from "./audit.js";
+import { bumpKbVersion, getKbVersion, getKbVersions } from "./kbVersions.js";
 
 // write()는 spec §4.1 시그니처에 title 인자가 없지만 pages.title은 NOT NULL이라,
 // 콘텐츠의 첫 markdown 헤딩(# ...)을 제목으로 쓰고 없으면 slug 마지막 세그먼트로 대체한다.
@@ -62,11 +63,18 @@ export function registerTools(server: McpServer, ctx: RequestContext): void {
       }
       const filtered = rows.filter((r) => readable.has(r.kb_id as string));
 
+      // §3.3: read/search 응답에 결과가 속한 KB의 현재 워터마크를 함께 반환한다.
+      const kbVersions = await getKbVersions(pool, [...readable]);
+      const withVersion = filtered.map((r) => ({
+        ...r,
+        kb_version: kbVersions.get(r.kb_id as string) ?? 0,
+      }));
+
       await recordAudit(pool, ctx.githubUser, null, "search", true);
 
       return {
-        content: [{ type: "text", text: JSON.stringify(filtered) }],
-        structuredContent: { results: filtered },
+        content: [{ type: "text", text: JSON.stringify(withVersion) }],
+        structuredContent: { results: withVersion },
       };
     },
   );
@@ -108,7 +116,9 @@ export function registerTools(server: McpServer, ctx: RequestContext): void {
 
       // pages.version은 bigint라 pg가 string으로 반환한다 — write()의 expected_version(number)과
       // 그대로 비교하면 항상 불일치하므로 여기서 number로 정규화해 응답한다.
-      const normalized = { ...page, version: Number(page.version) };
+      // kb_version은 pages.version(페이지별 낙관적 잠금)과는 별개인 KB 전체 워터마크(§3.3).
+      const kbVersion = await getKbVersion(pool, kb_id);
+      const normalized = { ...page, version: Number(page.version), kb_version: kbVersion };
 
       return {
         content: [{ type: "text", text: JSON.stringify(normalized) }],
@@ -219,6 +229,9 @@ export function registerTools(server: McpServer, ctx: RequestContext): void {
           );
         }
 
+        // §3.3: 페이지가 변경될 때마다 소속 KB의 워터마크를 증가시킨다.
+        await bumpKbVersion(client, kb_id);
+
         await client.query("COMMIT");
 
         return {
@@ -231,6 +244,31 @@ export function registerTools(server: McpServer, ctx: RequestContext): void {
       } finally {
         client.release();
       }
+    },
+  );
+
+  server.registerTool(
+    "get_kb_version",
+    {
+      title: "Get KB version",
+      description: "KB 전체 워터마크(버전 카운터) 조회 — stale 감지용 (§3.3)",
+      inputSchema: z.object({
+        kb_id: z.string(),
+      }),
+    },
+    async ({ kb_id }) => {
+      const decision = await authorize(ctx, kb_id, "read");
+      await recordAudit(pool, ctx.githubUser, kb_id, "get_kb_version", decision.allowed);
+      if (!decision.allowed) {
+        return denied(decision.reason);
+      }
+
+      const version = await getKbVersion(pool, kb_id);
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({ version }) }],
+        structuredContent: { version },
+      };
     },
   );
 }

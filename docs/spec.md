@@ -448,6 +448,7 @@ services:
       - GITHUB_OAUTH_CLIENT_SECRET=...
       - GITHUB_ORG=...   # org KB 읽기 권한(§5.1) 판단용 조직 slug. 미설정 시 인증된 사용자는 누구나 org read 허용(완화된 기본값)
       - WIKI_ADMINS=...  # org KB 쓰기 권한(§5.1) 판단용 github_user 콤마 목록. 미설정 시 org write는 전원 거부(안전한 기본값)
+      - GITHUB_WEBHOOK_SECRET=...  # /webhooks/github 서명 검증(§4.4). 미설정 시 해당 엔드포인트는 501로 거부(안전한 기본값) — 즉석 생성만으로 충분하면 생략 가능
     depends_on: [postgres]
   caddy:
     image: caddy:2

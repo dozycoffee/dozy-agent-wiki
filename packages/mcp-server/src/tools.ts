@@ -5,7 +5,8 @@ import { authorize, type RequestContext } from "./auth.js";
 import { ensureKbProvisioned } from "./provisioning.js";
 import { recordAudit } from "./audit.js";
 import { getKbVersion, getKbVersions } from "./kbVersions.js";
-import { commitChanges, type CommitResult } from "./commit.js";
+import { commitChanges, type CommitResult, type ChangeAction } from "./commit.js";
+import { getSession, insertSessionChange, getSessionChanges, requiredActionsFor } from "./sessions.js";
 
 function denied(reason: string | undefined) {
   return {
@@ -468,6 +469,255 @@ export function registerTools(server: McpServer, ctx: RequestContext): void {
       return {
         content: [{ type: "text", text: JSON.stringify({ version }) }],
         structuredContent: { version },
+      };
+    },
+  );
+
+  // --- 다중 페이지 원자적 커밋 세션 (§4.6) ---------------------------------------
+  //
+  // open_session → stage_write/stage_append/stage_delete(여러 번) → commit_session
+  // git과 비슷한 흐름. 세션 소유자만 자신의 세션을 stage/commit/abort할 수 있게
+  // 제한한다(spec §4.1 표에는 session_id 기반 tool의 권한 필요조건이 kb_id 기준
+  // read/write/삭제 권한으로만 적혀 있어 세션 소유권 검사까지는 명시돼 있지 않지만,
+  // session_id만 알면 남의 세션에 끼어들 수 있는 건 방어적으로 막는 게 맞다고 판단
+  // — PR에 명시할 판단).
+
+  async function handleStage(
+    sessionId: string,
+    slug: string,
+    action: ChangeAction,
+    content: string | undefined,
+    expectedVersion: number,
+    toolName: string,
+  ) {
+    const session = await getSession(pool, sessionId);
+    if (!session) {
+      return {
+        isError: true,
+        content: [{ type: "text" as const, text: `session not found: ${sessionId}` }],
+      };
+    }
+    if (session.opened_by !== ctx.githubUser) {
+      await recordAudit(pool, ctx.githubUser, session.kb_id, toolName, false);
+      return denied("session belongs to a different user");
+    }
+    if (session.status !== "open") {
+      return {
+        isError: true,
+        content: [
+          { type: "text" as const, text: `session is not open (status: ${session.status})` },
+        ],
+      };
+    }
+
+    const requiredAction = action === "delete" ? "delete" : "write";
+    const decision = await authorize(ctx, session.kb_id, requiredAction);
+    await recordAudit(pool, ctx.githubUser, session.kb_id, toolName, decision.allowed);
+    if (!decision.allowed) {
+      return denied(decision.reason);
+    }
+
+    await insertSessionChange(pool, sessionId, slug, action, content, expectedVersion);
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `staged ${action} for ${session.kb_id}/${slug} in session ${sessionId}`,
+        },
+      ],
+      structuredContent: { session_id: sessionId, slug, action },
+    };
+  }
+
+  server.registerTool(
+    "open_session",
+    {
+      title: "Open session",
+      description:
+        "편집 세션 시작 → session_id 발급 (§4.6). 여러 페이지를 하나의 논리적 변경으로 묶어 원자적으로 커밋할 때 사용",
+      inputSchema: z.object({ kb_id: z.string() }),
+    },
+    async ({ kb_id }) => {
+      const decision = await authorize(ctx, kb_id, "write");
+      await recordAudit(pool, ctx.githubUser, kb_id, "open_session", decision.allowed);
+      if (!decision.allowed) {
+        return denied(decision.reason);
+      }
+
+      await ensureKbProvisioned(pool, kb_id);
+
+      const { rows } = await pool.query<{ id: string; expires_at: string }>(
+        `INSERT INTO edit_sessions (kb_id, opened_by) VALUES ($1, $2) RETURNING id, expires_at`,
+        [kb_id, ctx.githubUser],
+      );
+      const session = rows[0];
+
+      return {
+        content: [{ type: "text", text: `opened session ${session.id} for ${kb_id}` }],
+        structuredContent: { session_id: session.id, expires_at: session.expires_at },
+      };
+    },
+  );
+
+  server.registerTool(
+    "stage_write",
+    {
+      title: "Stage write",
+      description: "세션에 전체 교체 변경사항 기록 (아직 미반영, commit_session에서 반영) (§4.6)",
+      inputSchema: z.object({
+        session_id: z.string(),
+        slug: z.string(),
+        content: z.string(),
+        expected_version: z.number().int().min(0),
+      }),
+    },
+    async ({ session_id, slug, content, expected_version }) =>
+      handleStage(session_id, slug, "write", content, expected_version, "stage_write"),
+  );
+
+  server.registerTool(
+    "stage_append",
+    {
+      title: "Stage append",
+      description: "세션에 append 변경사항 기록 (아직 미반영) (§4.6)",
+      inputSchema: z.object({
+        session_id: z.string(),
+        slug: z.string(),
+        content: z.string(),
+        expected_version: z.number().int().min(0),
+      }),
+    },
+    async ({ session_id, slug, content, expected_version }) =>
+      handleStage(session_id, slug, "append", content, expected_version, "stage_append"),
+  );
+
+  server.registerTool(
+    "stage_delete",
+    {
+      title: "Stage delete",
+      description: "세션에 삭제 변경사항 기록 (아직 미반영) (§4.6, 삭제 권한은 §5.1)",
+      inputSchema: z.object({
+        session_id: z.string(),
+        slug: z.string(),
+        expected_version: z.number().int().min(0),
+      }),
+    },
+    async ({ session_id, slug, expected_version }) =>
+      handleStage(session_id, slug, "delete", undefined, expected_version, "stage_delete"),
+  );
+
+  server.registerTool(
+    "commit_session",
+    {
+      title: "Commit session",
+      description:
+        "세션에 쌓인 변경사항을 한 트랜잭션으로 원자적 반영, 충돌 시 거부 (§4.6). 건드린 slug만 알파벳순 FOR UPDATE 잠금",
+      inputSchema: z.object({ session_id: z.string() }),
+    },
+    async ({ session_id }) => {
+      const session = await getSession(pool, session_id);
+      if (!session) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `session not found: ${session_id}` }],
+        };
+      }
+      if (session.opened_by !== ctx.githubUser) {
+        await recordAudit(pool, ctx.githubUser, session.kb_id, "commit_session", false);
+        return denied("session belongs to a different user");
+      }
+      if (session.status !== "open") {
+        return {
+          isError: true,
+          content: [
+            { type: "text", text: `session is not open (status: ${session.status})` },
+          ],
+        };
+      }
+
+      const changes = await getSessionChanges(pool, session_id);
+
+      // commit 시점에 다시 한 번 권한을 확인한다 — stage_* 시점에 이미 확인했지만,
+      // 그 사이 권한이 회수됐을 수 있어 방어적으로 재검증한다 (permission_cache TTL
+      // 안에서는 캐시로 처리되므로 추가 GitHub API 호출 비용은 거의 없다).
+      for (const action of requiredActionsFor(changes)) {
+        const decision = await authorize(ctx, session.kb_id, action);
+        if (!decision.allowed) {
+          await recordAudit(pool, ctx.githubUser, session.kb_id, "commit_session", false);
+          return denied(decision.reason);
+        }
+      }
+
+      if (changes.length === 0) {
+        await pool.query(`UPDATE edit_sessions SET status = 'committed' WHERE id = $1`, [session_id]);
+        await recordAudit(pool, ctx.githubUser, session.kb_id, "commit_session", true);
+        return {
+          content: [{ type: "text", text: `committed session ${session_id} (no staged changes)` }],
+          structuredContent: { status: "committed", results: [] },
+        };
+      }
+
+      const result = await commitChanges(pool, session.kb_id, ctx.githubUser, changes);
+
+      if (result.status === "conflict") {
+        await pool.query(`UPDATE edit_sessions SET status = 'conflict' WHERE id = $1`, [session_id]);
+        await recordAudit(pool, ctx.githubUser, session.kb_id, "commit_session", false);
+        return {
+          isError: true,
+          content: [
+            { type: "text", text: `session conflict: ${result.conflicts.length} slug(s)` },
+          ],
+          structuredContent: { status: "conflict", conflicts: result.conflicts },
+        };
+      }
+
+      await pool.query(`UPDATE edit_sessions SET status = 'committed' WHERE id = $1`, [session_id]);
+      await recordAudit(pool, ctx.githubUser, session.kb_id, "commit_session", true);
+
+      return {
+        content: [
+          { type: "text", text: `committed session ${session_id}: ${result.results.length} page(s)` },
+        ],
+        structuredContent: { status: "committed", results: result.results },
+      };
+    },
+  );
+
+  server.registerTool(
+    "abort_session",
+    {
+      title: "Abort session",
+      description: "세션 폐기 (§4.6)",
+      inputSchema: z.object({ session_id: z.string() }),
+    },
+    async ({ session_id }) => {
+      const session = await getSession(pool, session_id);
+      if (!session) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `session not found: ${session_id}` }],
+        };
+      }
+      if (session.opened_by !== ctx.githubUser) {
+        await recordAudit(pool, ctx.githubUser, session.kb_id, "abort_session", false);
+        return denied("session belongs to a different user");
+      }
+      if (session.status !== "open") {
+        return {
+          isError: true,
+          content: [
+            { type: "text", text: `session is not open (status: ${session.status})` },
+          ],
+        };
+      }
+
+      await pool.query(`UPDATE edit_sessions SET status = 'aborted' WHERE id = $1`, [session_id]);
+      await recordAudit(pool, ctx.githubUser, session.kb_id, "abort_session", true);
+
+      return {
+        content: [{ type: "text", text: `aborted session ${session_id}` }],
+        structuredContent: { status: "aborted" },
       };
     },
   );

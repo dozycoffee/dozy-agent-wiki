@@ -18,6 +18,7 @@ services:
       - GITHUB_OAUTH_CLIENT_SECRET=${GITHUB_OAUTH_CLIENT_SECRET}
       - GITHUB_ORG=${GITHUB_ORG}
       - WIKI_ADMINS=${WIKI_ADMINS}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
     depends_on:
       - postgres
 

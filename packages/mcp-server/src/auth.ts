@@ -5,7 +5,9 @@
 //   2. 요청 대상 kb_id 확인
 //   3. kb.type별 권한 규칙 적용 (§5.1)
 //   4. project KB의 경우 permission_cache 조회, 없으면 GitHub API 호출 후 짧은 TTL로 캐시
-//   5. (protected_patterns는 §4.7, 이 이슈 범위 밖)
+//   5. write/delete인 경우 protected_patterns 매칭 확인 → draft 경유 여부 결정
+//      (이 파일의 authorize()가 아니라 commit.ts의 commitChanges()가 커밋 시점에
+//      classifyProtection()으로 수행한다 — §4.7, protection.ts 참고)
 //   6. 허용/거부 결정 → audit_log 기록 (audit.ts)
 
 import type { Pool } from "pg";
@@ -20,7 +22,9 @@ import {
 import { getCachedPermission, setCachedPermission } from "./permissionCache.js";
 import { parseKbId } from "./kbId.js";
 
-export type ToolAction = "read" | "write";
+// "delete"는 §5.1에서 KB 유형별 문턱이 write보다 높다 (org/project는 관리자만,
+// personal은 write와 동일하게 본인만) — write와 분리된 별도 action으로 판단한다.
+export type ToolAction = "read" | "write" | "delete";
 
 export interface RequestContext {
   githubUser?: string;
@@ -101,8 +105,10 @@ async function isOrgReadAllowed(ctx: RequestContext, githubUser: string): Promis
 }
 
 /**
- * kb_id 하나에 대한 read/write 권한을 판단한다 (§5.1 매핑 규칙).
- * protected_patterns/pages_draft 게이트(§4.7)는 이 함수의 범위 밖 — 별도 이슈.
+ * kb_id 하나에 대한 read/write/delete 권한을 판단한다 (§5.1 매핑 규칙).
+ * protected_patterns/pages_draft 게이트(§4.7)는 이 함수의 범위 밖이다 — "이 유저가
+ * 이 KB에 쓸 수 있는가"(권한)와 "이 경로가 즉시 반영돼도 되는가"(보호 정책)는
+ * 별개 판단이라, 후자는 commit.ts의 commitChanges()가 커밋 시점에 처리한다.
  */
 export async function authorize(
   ctx: RequestContext,
@@ -123,9 +129,8 @@ export async function authorize(
       const allowed = await isOrgReadAllowed(ctx, ctx.githubUser);
       return allowed ? { allowed: true } : { allowed: false, reason: "not an org member" };
     }
-    // org 쓰기: §5.1에서 wiki-admins만 허용 (전체가 protected라 실질적으로 draft 경유 —
-    // 그 draft 승인 흐름 자체는 §4.7, 이 이슈 범위 밖. 여기선 "쓰기 시도 자체를 wiki-admin
-    // 에게만 허용"까지만 구현한다).
+    // org 쓰기/삭제: §5.1에서 둘 다 wiki-admins만 허용 (전체가 protected라 쓰기는
+    // 실질적으로 draft 경유 — §4.7). 삭제도 같은 문턱이라 write/delete를 분기하지 않는다.
     const admins = wikiAdmins();
     if (admins.size === 0) {
       // WIKI_ADMINS 미설정 시 아무도 org에 쓸 수 없는 게 안전한 기본값이다.
@@ -153,8 +158,10 @@ export async function authorize(
     await setCachedPermission(ctx.pool, ctx.githubUser, repoSlug, permission);
   }
 
-  const allowed = permissionAtLeast(permission, action);
+  // project 삭제: §5.1에서 repo **admin**만 허용 (write보다 높은 문턱).
+  const threshold = action === "delete" ? "admin" : action;
+  const allowed = permissionAtLeast(permission, threshold);
   return allowed
     ? { allowed: true }
-    : { allowed: false, reason: `insufficient repo permission for ${repoSlug} (have: ${permission})` };
+    : { allowed: false, reason: `insufficient repo permission for ${repoSlug} (have: ${permission}, need: ${threshold})` };
 }

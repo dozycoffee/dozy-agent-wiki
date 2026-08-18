@@ -223,6 +223,7 @@ get_kb_version(kb_id) → { version: 42 }
 | `delete(kb_id, slug, expected_version)` | **shorthand**: 단일 페이지 open+stage_delete+commit | §5.1 참조 (KB별 상이) |
 | `revert(kb_id, slug, history_id)` | 이전 버전으로 복원 (페이지 버전도 함께 증가) | write |
 | `lint(kb_id)` | 깨진 링크/고아 페이지 점검 | read |
+| `compile_index(kb_id)` | KB 내 현재 페이지 목록으로 `_index` 재구성 (§4.8 nightly routine의 1단계) | write |
 
 여러 페이지를 하나의 논리적 변경으로 묶으려면(예: nightly routine이 여러 문서를 한 번에 정리) `open_session` → 여러 번의 `stage_*` → `commit_session` 흐름을 쓴다. 단일 페이지만 바꿀 때는 `write`/`append`/`delete` shorthand로 충분하다.
 
@@ -385,6 +386,24 @@ KB 전체가 아니라 **경로 패턴 단위**로 신중한 처리를 강제한
 | project | 관리자가 지정한 일부 경로만 (예: `architecture/**`, `conventions`) | repo admin |
 | personal | 보호 불가 (patterns 등록 금지) | 해당 없음 |
 
+### 4.8 nightly 자동 컴파일 routine (설계 제안 + 부분 구현)
+
+§3.1/§4.6 예시/§4.3/§8에 "nightly 자동 컴파일 routine (원본 자료 → wiki 반영)"이 여러 곳에서 언급만 되고 정작 설계가 없었다. 이 섹션은 그 설계를 확정하기 위한 제안이며, 아래 중 **"1단계"만 실제로 구현**돼 있다 — 나머지는 원본 자료 소스 자체가 아직 정해지지 않아 코드 없이 설계만 남긴다.
+
+**1단계 — `_index` 재생성 (구현 완료)**
+
+가장 명확하게 정의 가능한 부분: KB 내 현재 `pages`(비삭제) 목록을 `category`(§3.2 GENERATED 컬럼)별로 묶어 `_index`를 재구성한다. `compile_index(kb_id)` tool로 노출 — `write`와 동일하게 `commitChanges()`(§4.6)를 거치므로 `protected_patterns`(§4.7) 게이트도 예외 없이 적용된다(org KB처럼 전체가 protected면 `_index` 재생성도 `pages_draft`를 거침 — 자동 생성 콘텐츠라고 게이트를 우회시키지 않는 게 일관적이라고 판단).
+
+트리거는 이 tool을 호출하는 쪽(cron, GitHub Actions 등)의 책임으로 남긴다 — MCP 서버 자체에는 스케줄러를 내장하지 않는다(§6.1 단일 VM 구성에 별도 스케줄러 프로세스를 두지 않는 selection과 일관).
+
+**2단계 이후 — 원본 자료 흡수 (미구현, 설계만)**
+
+이슈 본문이 제기한 열린 질문들에 대한 제안:
+
+- **"원본 자료"가 구체적으로 무엇인가**: 현재 스택(§7)에 Slack/타 문서 시스템 연동이 없고, 이 시스템의 유일한 콘텐츠 소스는 MCP tool을 통한 에이전트/사람의 `write`뿐이다. 따라서 1단계 범위를 벗어나는 "외부 원본 자료 → wiki 반영"은 **아직 흡수할 외부 소스 자체가 정해지지 않은 상태**로 판단한다. 후보(GitHub PR/커밋 로그, Slack 채널 로그 등)는 각각 별도 인입 경로 설계(권한 매핑, protected_patterns 적용 여부, 중복 방지)가 필요해 이 이슈 하나로 묶기보다 소스별로 별도 이슈를 여는 걸 제안한다.
+- **트리거/주기**: `_index` 재생성처럼 tool 호출 자체는 서버가 갖고, 스케줄링은 외부(GitHub Actions cron, systemd timer 등)에 맡기는 방식을 제안한다 — MCP 서버가 트래픽이 적은 단일 프로세스(§6.1)라 내부 스케줄러를 추가하면 배포 복잡도만 늘어난다. 주기는 트래픽이 적은 새벽 시간대(예: KST 03:00) 1일 1회를 기본값으로 제안.
+- **서비스 계정**: §4.3에 이미 명시된 대로 GitHub App 설치 토큰을 사용해 개인 PAT와 분리한다 — 이 토큰으로 `compile_index` 등 nightly tool을 호출하는 클라이언트(예: GitHub Actions workflow)를 별도로 인증한다.
+
 ---
 
 ## 5. 권한 모델
@@ -448,6 +467,7 @@ services:
       - GITHUB_OAUTH_CLIENT_SECRET=...
       - GITHUB_ORG=...   # org KB 읽기 권한(§5.1) 판단용 조직 slug. 미설정 시 인증된 사용자는 누구나 org read 허용(완화된 기본값)
       - WIKI_ADMINS=...  # org KB 쓰기 권한(§5.1) 판단용 github_user 콤마 목록. 미설정 시 org write는 전원 거부(안전한 기본값)
+      - GITHUB_WEBHOOK_SECRET=...  # /webhooks/github 서명 검증(§4.4). 미설정 시 해당 엔드포인트는 501로 거부(안전한 기본값) — 즉석 생성만으로 충분하면 생략 가능
     depends_on: [postgres]
   caddy:
     image: caddy:2
@@ -484,13 +504,13 @@ services:
 - 단일 페이지 커밋 시 `expected_version` 비교 + `pages_history` 이력 기록 (충돌 감지 최소 버전)
 
 **2차 구현**
-- `append`, `delete`, `revert`, `list_pages`, `lint` tool
-- `open_session`/`stage_write`/`stage_append`/`stage_delete`/`commit_session`/`abort_session` (다중 페이지 원자적 커밋)
-- `kb_versions` 워터마크 + `get_kb_version` tool + `read`/`search` 응답에 `version` 포함
-- `protected_patterns` + `pages_draft` 승인 흐름 (block/notify)
+- `append`, `delete`, `revert`, `list_pages`, `lint` tool — 완료
+- `open_session`/`stage_write`/`stage_append`/`stage_delete`/`commit_session`/`abort_session` (다중 페이지 원자적 커밋) — 완료
+- `kb_versions` 워터마크 + `get_kb_version` tool + `read`/`search` 응답에 `version` 포함 — 완료
+- `protected_patterns` + `pages_draft` 승인 흐름 (block/notify) — 완료 (draft 승인 자체를 반영하는 tool은 §9 미해결 이슈라 아직 없음, §4.7 참고)
 - `wiki-cli push` 서브커맨드
-- nightly 자동 컴파일 routine (원본 자료 → wiki 반영)
-- GitHub 웹훅 기반 사전 프로비저닝
+- nightly 자동 컴파일 routine (원본 자료 → wiki 반영) — `_index` 재생성(`compile_index`)만 완료, 나머지는 원본 자료 소스가 미정이라 §4.8에 설계 제안만 남김
+- GitHub 웹훅 기반 사전 프로비저닝 — 완료
 
 **3차 구현**
 - 간단한 조회/업로드 웹 UI

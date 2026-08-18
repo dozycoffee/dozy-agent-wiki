@@ -5,6 +5,7 @@
 // 주의: `mcp` 서브커맨드는 stdout으로 JSON-RPC를 주고받으므로,
 // 이 경로에서는 어떤 로그도 stdout에 출력하지 말 것 (console.error만 사용).
 
+import path from "node:path";
 import { Command } from "commander";
 import { runMcpRelay } from "./mcp-relay.js";
 import {
@@ -15,6 +16,7 @@ import {
 } from "./github-auth.js";
 import { loadToken, saveToken } from "./keychain.js";
 import { openBrowser } from "./open-browser.js";
+import { PushAuthError, pushFiles } from "./push.js";
 
 const program = new Command();
 
@@ -34,12 +36,39 @@ program
   });
 
 program
-  .command("push <file>")
+  .command("push <files...>")
   .option("--kb <kb_id>", "대상 knowledge base id")
-  .description("md 파일을 지정한 KB에 업로드 (§4.5)")
-  .action(async (file: string, opts: { kb?: string }) => {
-    // TODO(§4.5): POST /api/kb/{kb_id}/pages 로 multipart 업로드
-    console.log(`[wiki-cli push] not implemented yet: ${file} -> ${opts.kb}`);
+  .description("md 파일을 지정한 KB에 업로드. glob으로 여러 파일 일괄 업로드 가능 (§4.5)")
+  .action(async (files: string[], opts: { kb?: string }) => {
+    if (!opts.kb) {
+      console.error("[wiki-cli push] --kb <kb_id> 옵션이 필요합니다.");
+      process.exitCode = 1;
+      return;
+    }
+
+    try {
+      const results = await pushFiles(files, { kbId: opts.kb });
+
+      let hadFailure = false;
+      for (const result of results) {
+        const relPath = path.relative(process.cwd(), result.file);
+        if (result.ok) {
+          console.log(`업로드 완료: ${relPath} -> ${opts.kb}/${result.slug} (version ${result.version})`);
+        } else {
+          hadFailure = true;
+          console.error(`업로드 실패: ${relPath} - ${result.error}`);
+        }
+      }
+
+      if (hadFailure) process.exitCode = 1;
+    } catch (err) {
+      if (err instanceof PushAuthError) {
+        console.error(`[wiki-cli push] ${err.message}`);
+      } else {
+        console.error("[wiki-cli push] 실패:", err instanceof Error ? err.message : err);
+      }
+      process.exitCode = 1;
+    }
   });
 
 program

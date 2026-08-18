@@ -12,6 +12,7 @@
     "migrate:create": "node-pg-migrate create -j sql --migration-filename-format utc"
   },
   "dependencies": {
+    "@fastify/multipart": "^10.1.1",
     "@modelcontextprotocol/fastify": "^2.0.0",
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",

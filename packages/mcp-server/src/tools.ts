@@ -2,17 +2,8 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { pool } from "./db.js";
 import { authorize, type RequestContext } from "./auth.js";
-import { ensureKbProvisioned } from "./provisioning.js";
 import { recordAudit } from "./audit.js";
-
-// write()는 spec §4.1 시그니처에 title 인자가 없지만 pages.title은 NOT NULL이라,
-// 콘텐츠의 첫 markdown 헤딩(# ...)을 제목으로 쓰고 없으면 slug 마지막 세그먼트로 대체한다.
-function deriveTitle(slug: string, content: string): string {
-  const heading = content.match(/^#\s+(.+)$/m);
-  if (heading) return heading[1].trim();
-  const lastSegment = slug.split("/").pop();
-  return lastSegment ?? slug;
-}
+import { writePage } from "./pageWrite.js";
 
 function denied(reason: string | undefined) {
   return {
@@ -168,69 +159,28 @@ export function registerTools(server: McpServer, ctx: RequestContext): void {
         return denied(decision.reason);
       }
 
-      // write는 대상 kb_id를 명확히 겨냥하는 tool이라(§4.4) 여기서 KB 즉석 프로비저닝을
-      // 트리거한다 — authorize()가 이미 통과했으므로(project: read≥, personal: 본인)
-      // 이 요청은 해당 KB에 정당하게 접근 가능하다.
-      await ensureKbProvisioned(pool, kb_id);
+      const result = await writePage(pool, kb_id, slug, content, {
+        expectedVersion: expected_version,
+        updatedBy: ctx.githubUser,
+      });
 
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-
-        const { rows } = await client.query(
-          `SELECT version, content_md FROM pages WHERE kb_id = $1 AND slug = $2 FOR UPDATE`,
-          [kb_id, slug],
-        );
-        const existing = rows[0] as { version: string; content_md: string } | undefined;
-        // pages.version은 bigint → pg가 string으로 반환한다. expected_version(number)과
-        // 문자열 대 숫자로 비교하면 항상 불일치("1" !== 1) 판정되므로 Number로 정규화한다.
-        const current = existing ? Number(existing.version) : 0;
-
-        if (current !== expected_version) {
-          await client.query("ROLLBACK");
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text: `version conflict: expected ${expected_version}, current ${current}`,
-              },
-            ],
-            structuredContent: { conflict: true, expected: expected_version, current },
-          };
-        }
-
-        const title = deriveTitle(slug, content);
-
-        if (existing) {
-          await client.query(
-            `INSERT INTO pages_history (kb_id, slug, content_md, action) VALUES ($1, $2, $3, 'write')`,
-            [kb_id, slug, existing.content_md],
-          );
-          await client.query(
-            `UPDATE pages SET content_md = $3, title = $4, updated_by = $5, version = version + 1, updated_at = now()
-             WHERE kb_id = $1 AND slug = $2`,
-            [kb_id, slug, content, title, ctx.githubUser],
-          );
-        } else {
-          await client.query(
-            `INSERT INTO pages (kb_id, slug, title, content_md, updated_by) VALUES ($1, $2, $3, $4, $5)`,
-            [kb_id, slug, title, content, ctx.githubUser],
-          );
-        }
-
-        await client.query("COMMIT");
-
+      if (result.conflict) {
         return {
-          content: [{ type: "text", text: `wrote ${kb_id}/${slug} (version ${current + 1})` }],
-          structuredContent: { kb_id, slug, title, version: current + 1 },
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `version conflict: expected ${result.expected}, current ${result.current}`,
+            },
+          ],
+          structuredContent: { conflict: true, expected: result.expected, current: result.current },
         };
-      } catch (err) {
-        await client.query("ROLLBACK");
-        throw err;
-      } finally {
-        client.release();
       }
+
+      return {
+        content: [{ type: "text", text: `wrote ${kb_id}/${slug} (version ${result.version})` }],
+        structuredContent: { kb_id, slug, title: result.title, version: result.version },
+      };
     },
   );
 }

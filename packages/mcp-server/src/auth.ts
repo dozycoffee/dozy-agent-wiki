@@ -20,7 +20,9 @@ import {
 import { getCachedPermission, setCachedPermission } from "./permissionCache.js";
 import { parseKbId } from "./kbId.js";
 
-export type ToolAction = "read" | "write";
+// "delete"는 §5.1에서 KB 유형별 문턱이 write보다 높다 (org/project는 관리자만,
+// personal은 write와 동일하게 본인만) — write와 분리된 별도 action으로 판단한다.
+export type ToolAction = "read" | "write" | "delete";
 
 export interface RequestContext {
   githubUser?: string;
@@ -123,9 +125,8 @@ export async function authorize(
       const allowed = await isOrgReadAllowed(ctx, ctx.githubUser);
       return allowed ? { allowed: true } : { allowed: false, reason: "not an org member" };
     }
-    // org 쓰기: §5.1에서 wiki-admins만 허용 (전체가 protected라 실질적으로 draft 경유 —
-    // 그 draft 승인 흐름 자체는 §4.7, 이 이슈 범위 밖. 여기선 "쓰기 시도 자체를 wiki-admin
-    // 에게만 허용"까지만 구현한다).
+    // org 쓰기/삭제: §5.1에서 둘 다 wiki-admins만 허용 (전체가 protected라 쓰기는
+    // 실질적으로 draft 경유 — §4.7). 삭제도 같은 문턱이라 write/delete를 분기하지 않는다.
     const admins = wikiAdmins();
     if (admins.size === 0) {
       // WIKI_ADMINS 미설정 시 아무도 org에 쓸 수 없는 게 안전한 기본값이다.
@@ -153,8 +154,10 @@ export async function authorize(
     await setCachedPermission(ctx.pool, ctx.githubUser, repoSlug, permission);
   }
 
-  const allowed = permissionAtLeast(permission, action);
+  // project 삭제: §5.1에서 repo **admin**만 허용 (write보다 높은 문턱).
+  const threshold = action === "delete" ? "admin" : action;
+  const allowed = permissionAtLeast(permission, threshold);
   return allowed
     ? { allowed: true }
-    : { allowed: false, reason: `insufficient repo permission for ${repoSlug} (have: ${permission})` };
+    : { allowed: false, reason: `insufficient repo permission for ${repoSlug} (have: ${permission}, need: ${threshold})` };
 }

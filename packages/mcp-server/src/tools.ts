@@ -4,21 +4,44 @@ import { pool } from "./db.js";
 import { authorize, type RequestContext } from "./auth.js";
 import { ensureKbProvisioned } from "./provisioning.js";
 import { recordAudit } from "./audit.js";
-import { bumpKbVersion, getKbVersion, getKbVersions } from "./kbVersions.js";
-
-// write()는 spec §4.1 시그니처에 title 인자가 없지만 pages.title은 NOT NULL이라,
-// 콘텐츠의 첫 markdown 헤딩(# ...)을 제목으로 쓰고 없으면 slug 마지막 세그먼트로 대체한다.
-function deriveTitle(slug: string, content: string): string {
-  const heading = content.match(/^#\s+(.+)$/m);
-  if (heading) return heading[1].trim();
-  const lastSegment = slug.split("/").pop();
-  return lastSegment ?? slug;
-}
+import { getKbVersion, getKbVersions } from "./kbVersions.js";
+import { commitChanges, type CommitResult } from "./commit.js";
 
 function denied(reason: string | undefined) {
   return {
     isError: true,
     content: [{ type: "text" as const, text: `permission denied: ${reason ?? "unknown reason"}` }],
+  };
+}
+
+/**
+ * commitChanges()의 결과를 tool 응답으로 번역한다. write/append/delete/revert
+ * shorthand가 모두 이 헬퍼를 공유한다 (§4.6, commit.ts 참고).
+ */
+function respondFromCommit(kbId: string, result: CommitResult, verb: string) {
+  if (result.status === "conflict") {
+    const [first] = result.conflicts;
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text" as const,
+          text: `version conflict: expected ${first.expected}, current ${first.current}`,
+        },
+      ],
+      structuredContent: { conflict: true, conflicts: result.conflicts },
+    };
+  }
+
+  const [applied] = result.results;
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: `${verb} ${kbId}/${applied.slug} (version ${applied.version})`,
+      },
+    ],
+    structuredContent: { kb_id: kbId, ...applied },
   };
 }
 
@@ -183,67 +206,244 @@ export function registerTools(server: McpServer, ctx: RequestContext): void {
       // 이 요청은 해당 KB에 정당하게 접근 가능하다.
       await ensureKbProvisioned(pool, kb_id);
 
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
+      // write는 spec §4.6에 "open+stage_write+commit의 shorthand"로 명시돼 있다 —
+      // 공용 commitChanges()(§4.6 pseudocode 구현체, commit.ts)를 단일 변경으로 호출한다.
+      const result = await commitChanges(pool, kb_id, ctx.githubUser, [
+        { slug, action: "write", content, expectedVersion: expected_version },
+      ]);
 
-        const { rows } = await client.query(
-          `SELECT version, content_md FROM pages WHERE kb_id = $1 AND slug = $2 FOR UPDATE`,
-          [kb_id, slug],
-        );
-        const existing = rows[0] as { version: string; content_md: string } | undefined;
-        // pages.version은 bigint → pg가 string으로 반환한다. expected_version(number)과
-        // 문자열 대 숫자로 비교하면 항상 불일치("1" !== 1) 판정되므로 Number로 정규화한다.
-        const current = existing ? Number(existing.version) : 0;
+      return respondFromCommit(kb_id, result, "wrote");
+    },
+  );
 
-        if (current !== expected_version) {
-          await client.query("ROLLBACK");
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text: `version conflict: expected ${expected_version}, current ${current}`,
-              },
-            ],
-            structuredContent: { conflict: true, expected: expected_version, current },
-          };
-        }
-
-        const title = deriveTitle(slug, content);
-
-        if (existing) {
-          await client.query(
-            `INSERT INTO pages_history (kb_id, slug, content_md, action) VALUES ($1, $2, $3, 'write')`,
-            [kb_id, slug, existing.content_md],
-          );
-          await client.query(
-            `UPDATE pages SET content_md = $3, title = $4, updated_by = $5, version = version + 1, updated_at = now()
-             WHERE kb_id = $1 AND slug = $2`,
-            [kb_id, slug, content, title, ctx.githubUser],
-          );
-        } else {
-          await client.query(
-            `INSERT INTO pages (kb_id, slug, title, content_md, updated_by) VALUES ($1, $2, $3, $4, $5)`,
-            [kb_id, slug, title, content, ctx.githubUser],
-          );
-        }
-
-        // §3.3: 페이지가 변경될 때마다 소속 KB의 워터마크를 증가시킨다.
-        await bumpKbVersion(client, kb_id);
-
-        await client.query("COMMIT");
-
-        return {
-          content: [{ type: "text", text: `wrote ${kb_id}/${slug} (version ${current + 1})` }],
-          structuredContent: { kb_id, slug, title, version: current + 1 },
-        };
-      } catch (err) {
-        await client.query("ROLLBACK");
-        throw err;
-      } finally {
-        client.release();
+  server.registerTool(
+    "append",
+    {
+      title: "Append",
+      description: "단일 페이지 뒤에 내용 추가(전체 교체 아님). expected_version으로 낙관적 잠금 (§4.6)",
+      inputSchema: z.object({
+        kb_id: z.string(),
+        slug: z.string(),
+        content: z.string(),
+        expected_version: z.number().int().min(0),
+      }),
+    },
+    async ({ kb_id, slug, content, expected_version }) => {
+      const decision = await authorize(ctx, kb_id, "write");
+      await recordAudit(pool, ctx.githubUser, kb_id, "append", decision.allowed);
+      if (!decision.allowed) {
+        return denied(decision.reason);
       }
+
+      await ensureKbProvisioned(pool, kb_id);
+
+      const result = await commitChanges(pool, kb_id, ctx.githubUser, [
+        { slug, action: "append", content, expectedVersion: expected_version },
+      ]);
+
+      return respondFromCommit(kb_id, result, "appended to");
+    },
+  );
+
+  server.registerTool(
+    "delete",
+    {
+      title: "Delete",
+      description:
+        "단일 페이지 삭제. KB 유형별 문턱이 다르다(§5.1) — org/project는 관리자만+soft-delete, personal은 본인+즉시 삭제",
+      inputSchema: z.object({
+        kb_id: z.string(),
+        slug: z.string(),
+        expected_version: z.number().int().min(0),
+      }),
+    },
+    async ({ kb_id, slug, expected_version }) => {
+      const decision = await authorize(ctx, kb_id, "delete");
+      await recordAudit(pool, ctx.githubUser, kb_id, "delete", decision.allowed);
+      if (!decision.allowed) {
+        return denied(decision.reason);
+      }
+
+      // delete는 새 KB를 만들 이유가 없는 destructive tool이라 프로비저닝을 트리거하지 않는다.
+      const result = await commitChanges(pool, kb_id, ctx.githubUser, [
+        { slug, action: "delete", expectedVersion: expected_version },
+      ]);
+
+      return respondFromCommit(kb_id, result, "deleted");
+    },
+  );
+
+  server.registerTool(
+    "revert",
+    {
+      title: "Revert",
+      description: "pages_history의 특정 시점 내용으로 복원 (페이지 version도 함께 증가) (§4.6)",
+      inputSchema: z.object({
+        kb_id: z.string(),
+        slug: z.string(),
+        history_id: z.number().int(),
+      }),
+    },
+    async ({ kb_id, slug, history_id }) => {
+      const decision = await authorize(ctx, kb_id, "write");
+      await recordAudit(pool, ctx.githubUser, kb_id, "revert", decision.allowed);
+      if (!decision.allowed) {
+        return denied(decision.reason);
+      }
+
+      const { rows: histRows } = await pool.query<{ content_md: string }>(
+        `SELECT content_md FROM pages_history WHERE id = $1 AND kb_id = $2 AND slug = $3`,
+        [history_id, kb_id, slug],
+      );
+      const historyEntry = histRows[0];
+      if (!historyEntry) {
+        return {
+          isError: true,
+          content: [
+            { type: "text", text: `history entry not found: id=${history_id} for ${kb_id}/${slug}` },
+          ],
+        };
+      }
+
+      // revert(kb_id, slug, history_id)는 spec 시그니처에 expected_version이 없다 —
+      // 커밋 직전 실제 현재 버전을 읽어 그걸 expected로 넘긴다. commitChanges()의 FOR
+      // UPDATE 잠금 안에서 다시 한 번 검증되므로, 이 사이 짧은 TOCTOU 창이 있어도 최종
+      // 정합성은 깨지지 않는다(그 사이 다른 변경이 있었으면 그냥 conflict로 거부됨).
+      const { rows: curRows } = await pool.query<{ version: string }>(
+        `SELECT version FROM pages WHERE kb_id = $1 AND slug = $2 AND deleted_at IS NULL`,
+        [kb_id, slug],
+      );
+      const expectedVersion = curRows[0] ? Number(curRows[0].version) : 0;
+
+      const result = await commitChanges(pool, kb_id, ctx.githubUser, [
+        {
+          slug,
+          action: "write",
+          content: historyEntry.content_md,
+          expectedVersion,
+          historyLabel: "revert",
+        },
+      ]);
+
+      return respondFromCommit(kb_id, result, "reverted");
+    },
+  );
+
+  server.registerTool(
+    "list_pages",
+    {
+      title: "List pages",
+      description: "KB 내 slug 목록 조회, category(§3.2 GENERATED 컬럼)별 그룹핑 (§4.1)",
+      inputSchema: z.object({
+        kb_id: z.string(),
+        prefix: z.string().optional(),
+      }),
+    },
+    async ({ kb_id, prefix }) => {
+      const decision = await authorize(ctx, kb_id, "read");
+      await recordAudit(pool, ctx.githubUser, kb_id, "list_pages", decision.allowed);
+      if (!decision.allowed) {
+        return denied(decision.reason);
+      }
+
+      const { rows } = await pool.query(
+        `SELECT slug, title, category, version, updated_at
+         FROM pages
+         WHERE kb_id = $1 AND deleted_at IS NULL
+           AND ($2::text IS NULL OR slug LIKE $2 || '%')
+         ORDER BY category, slug`,
+        [kb_id, prefix ?? null],
+      );
+
+      const pages = rows.map((r) => ({ ...r, version: Number(r.version) }));
+      const byCategory: Record<string, typeof pages> = {};
+      for (const page of pages) {
+        const key = page.category as string;
+        (byCategory[key] ??= []).push(page);
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(pages) }],
+        structuredContent: { pages, by_category: byCategory },
+      };
+    },
+  );
+
+  server.registerTool(
+    "lint",
+    {
+      title: "Lint",
+      description: "KB 내 깨진 링크(존재하지 않는 slug를 가리키는 markdown 링크)/고아 페이지 점검",
+      inputSchema: z.object({
+        kb_id: z.string(),
+      }),
+    },
+    async ({ kb_id }) => {
+      const decision = await authorize(ctx, kb_id, "read");
+      await recordAudit(pool, ctx.githubUser, kb_id, "lint", decision.allowed);
+      if (!decision.allowed) {
+        return denied(decision.reason);
+      }
+
+      const { rows } = await pool.query<{ slug: string; content_md: string }>(
+        `SELECT slug, content_md FROM pages WHERE kb_id = $1 AND deleted_at IS NULL`,
+        [kb_id],
+      );
+
+      const existingSlugs = new Set(rows.map((r) => r.slug));
+      const linkedSlugs = new Set<string>();
+      const brokenLinks: Array<{ from_slug: string; target: string }> = [];
+
+      // 링크 규약(spec에 명시돼 있지 않아 이 구현에서 채택): markdown 링크
+      // `[text](target)`와 위키링크 `[[target]]` 둘 다 지원. `http(s)://`, `mailto:`,
+      // `#`으로 시작하는 target은 KB 내부 slug 참조가 아니므로 제외한다.
+      const mdLinkRe = /\[[^\]]*\]\(([^)\s]+)\)/g;
+      const wikiLinkRe = /\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
+
+      function normalizeTarget(raw: string): string {
+        return raw.replace(/^\.\//, "").replace(/#.*$/, "").trim();
+      }
+
+      function isExternal(raw: string): boolean {
+        return /^(https?:|mailto:|#)/i.test(raw);
+      }
+
+      for (const page of rows) {
+        for (const match of page.content_md.matchAll(mdLinkRe)) {
+          const raw = match[1];
+          if (isExternal(raw)) continue;
+          const target = normalizeTarget(raw);
+          if (!target) continue;
+          linkedSlugs.add(target);
+          if (!existingSlugs.has(target)) {
+            brokenLinks.push({ from_slug: page.slug, target });
+          }
+        }
+        for (const match of page.content_md.matchAll(wikiLinkRe)) {
+          const target = normalizeTarget(match[1]);
+          if (!target) continue;
+          linkedSlugs.add(target);
+          if (!existingSlugs.has(target)) {
+            brokenLinks.push({ from_slug: page.slug, target });
+          }
+        }
+      }
+
+      // 고아 페이지: 예약 페이지(_index, _log)는 애초에 다른 페이지에서 링크되지 않는
+      // 진입점이라 판정에서 제외한다.
+      const orphanPages = [...existingSlugs].filter(
+        (slug) => slug !== "_index" && slug !== "_log" && !linkedSlugs.has(slug),
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ broken_links: brokenLinks, orphan_pages: orphanPages }),
+          },
+        ],
+        structuredContent: { broken_links: brokenLinks, orphan_pages: orphanPages },
+      };
     },
   );
 

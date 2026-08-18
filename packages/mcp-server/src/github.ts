@@ -89,7 +89,7 @@ const PERMISSION_RANK: Record<string, number> = {
   admin: 5,
 };
 
-export function permissionAtLeast(permission: string, threshold: "read" | "write"): boolean {
+export function permissionAtLeast(permission: string, threshold: "read" | "write" | "admin"): boolean {
   const rank = PERMISSION_RANK[permission] ?? 0;
   const minRank = PERMISSION_RANK[threshold];
   return rank >= minRank;

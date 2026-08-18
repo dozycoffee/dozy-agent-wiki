@@ -7,6 +7,7 @@ import { recordAudit } from "./audit.js";
 import { getKbVersion, getKbVersions } from "./kbVersions.js";
 import { commitChanges, type CommitResult, type ChangeAction } from "./commit.js";
 import { getSession, insertSessionChange, getSessionChanges, requiredActionsFor } from "./sessions.js";
+import { renderIndex } from "./indexCompile.js";
 
 function denied(reason: string | undefined) {
   return {
@@ -459,6 +460,47 @@ export function registerTools(server: McpServer, ctx: RequestContext): void {
         ],
         structuredContent: { broken_links: brokenLinks, orphan_pages: orphanPages },
       };
+    },
+  );
+
+  server.registerTool(
+    "compile_index",
+    {
+      title: "Compile index",
+      description:
+        "KB 내 현재 페이지 목록으로 _index 페이지를 재구성한다 (§3.1). nightly 자동 컴파일 " +
+        "routine 중 설계가 확정된 부분만 구현한 것 — 나머지(원본 자료 흡수 등)는 §4.8 설계 " +
+        "제안 참고. 사람/자동화가 원하는 시점에 직접 호출하는 형태(예: cron이 이 tool을 호출)",
+      inputSchema: z.object({ kb_id: z.string() }),
+    },
+    async ({ kb_id }) => {
+      const decision = await authorize(ctx, kb_id, "write");
+      await recordAudit(pool, ctx.githubUser, kb_id, "compile_index", decision.allowed);
+      if (!decision.allowed) {
+        return denied(decision.reason);
+      }
+
+      await ensureKbProvisioned(pool, kb_id);
+
+      const { rows } = await pool.query<{ slug: string; title: string; category: string }>(
+        `SELECT slug, title, category FROM pages WHERE kb_id = $1 AND deleted_at IS NULL`,
+        [kb_id],
+      );
+      const content = renderIndex(rows);
+
+      const { rows: curRows } = await pool.query<{ version: string }>(
+        `SELECT version FROM pages WHERE kb_id = $1 AND slug = '_index' AND deleted_at IS NULL`,
+        [kb_id],
+      );
+      const expectedVersion = curRows[0] ? Number(curRows[0].version) : 0;
+
+      // org KB처럼 전체가 protected(**)인 경우 _index 재생성도 예외 없이 draft를
+      // 거친다 — 자동 생성 콘텐츠라고 게이트를 우회시키지 않는 게 일관적이라고 판단.
+      const result = await commitChanges(pool, kb_id, ctx.githubUser, [
+        { slug: "_index", action: "write", content, expectedVersion, historyLabel: "write" },
+      ]);
+
+      return respondFromCommit(kb_id, result, "compiled");
     },
   );
 
